@@ -1,14 +1,8 @@
-/// fleet.rs — card data model shared by all simulator binaries.
-
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use shared::GpsCoords;
 use std::collections::HashSet;
 
-// ── Region ────────────────────────────────────────────────────────────────────
-
-/// Broad geographic region that determines where a card's normal
-/// transactions are located and what counts as "impossible travel".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Region {
     Poland,
@@ -25,7 +19,6 @@ impl Region {
         Self::EastAsia,
     ];
 
-    /// Pick a region uniformly at random.
     pub fn random(rng: &mut SmallRng) -> Self {
         match rng.gen_range(0..4) {
             0 => Self::Poland,
@@ -35,7 +28,6 @@ impl Region {
         }
     }
 
-    /// Sample a random GPS point inside this region's bounding box.
     pub fn sample_location(&self, rng: &mut SmallRng) -> GpsCoords {
         let (lat, lon) = match self {
             Self::Poland        => (49.0_f64..54.9,  14.1..24.1),
@@ -57,28 +49,16 @@ impl Region {
     }
 }
 
-// ── CardState ─────────────────────────────────────────────────────────────────
-
-/// Live per-card state kept in memory by the simulator.
 #[derive(Debug)]
 pub struct CardState {
     pub card_id:         String,
     pub user_id:         String,
-    /// "Normal" amount — log-uniformly drawn at startup. Range: ~10–800 PLN.
     pub typical_amount:  f64,
-    /// Remaining spending limit. Decremented each transaction.
     pub limit:           f64,
-    /// Region where normal transactions occur.
     pub home_region:     Region,
-    /// Last GPS position — updated every transaction.
     pub last_location:   GpsCoords,
-    /// Set of regions this card has ever transacted in.
-    /// Seeded with home_region at build time.
-    /// Used by NewGeography injection: pick a region NOT in this set.
     pub visited_regions: HashSet<Region>,
 }
-
-// ── Fleet builder ─────────────────────────────────────────────────────────────
 
 pub fn build_fleet(n: usize, rng: &mut SmallRng) -> Vec<CardState> {
     let n_users = ((n as f64) / 1.4) as usize;

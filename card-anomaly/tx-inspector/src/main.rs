@@ -1,19 +1,3 @@
-/// tx-inspector — M4: validate and pretty-print transactions from Kafka.
-///
-/// Reads from the "transactions" topic and for every message:
-///   1. Checks the payload is valid UTF-8
-///   2. Parses it as a Transaction (schema check)
-///   3. Runs 5 sanity checks on the field values
-///   4. Prints anomalous and invalid transactions immediately
-///   5. Prints a stats summary every 5 seconds
-///
-/// Run:
-///   cargo run --bin tx-inspector
-///   cargo run --bin tx-inspector -- --verbose              (print every message)
-///   cargo run --bin tx-inspector -- --filter-card CARD-000042
-///   cargo run --bin tx-inspector -- --group fresh          (re-read from beginning)
-///   cargo run --bin tx-inspector -- --offset latest        (only new messages)
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use rdkafka::config::ClientConfig;
@@ -23,35 +7,25 @@ use shared::{AnomalyKind, Transaction, TOPIC_TRANSACTIONS};
 use std::collections::HashMap;
 use std::time::Instant;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(name = "tx-inspector", about = "Validate and print transactions from Kafka")]
 struct Args {
     #[arg(long, default_value = "localhost:9092")]
     broker: String,
 
-    /// Consumer group ID. Change to a fresh value to re-read from the start.
     #[arg(long, default_value = "tx-inspector-dev")]
     group: String,
 
-    /// Where to start when this group has no saved offset.
-    /// "earliest" = all stored messages. "latest" = only new ones.
     #[arg(long, default_value = "earliest")]
     offset: String,
 
-    /// Print every valid transaction, not just anomalous and invalid ones.
     #[arg(long)]
     verbose: bool,
 
-    /// Only show messages whose card_id contains this string.
     #[arg(long)]
     filter_card: Option<String>,
 }
 
-// ── ANSI colour helpers ───────────────────────────────────────────────────────
-
-// We use raw ANSI codes so there are no extra dependencies.
 const RED:    &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const GREEN:  &str = "\x1b[32m";
@@ -71,10 +45,6 @@ fn colour_for_anomaly(kind: &AnomalyKind) -> &'static str {
     }
 }
 
-// ── Sanity checks ─────────────────────────────────────────────────────────────
-
-/// Run field-level checks on a parsed Transaction.
-/// Returns a list of human-readable issue strings (empty = all good).
 fn sanity_check(tx: &Transaction) -> Vec<String> {
     let mut issues = Vec::new();
 
@@ -103,15 +73,11 @@ fn sanity_check(tx: &Transaction) -> Vec<String> {
     issues
 }
 
-// ── Statistics ────────────────────────────────────────────────────────────────
-
 struct Stats {
     received:    u64,
     valid:       u64,
     invalid:     u64,
-    /// Count of messages that passed parsing but failed a sanity check.
     bad_fields:  u64,
-    /// Count of messages with injected_anomaly set.
     anomalous:   u64,
     by_kind:     HashMap<String, u64>,
     amount_min:  f64,
@@ -196,12 +162,10 @@ fn print_transaction(
     let is_anomalous = tx.injected_anomaly.is_some();
     let is_invalid   = !issues.is_empty();
 
-    // Decide whether to print at all.
     if !verbose && !is_anomalous && !is_invalid {
         return;
     }
 
-    // Build the tag line.
     let (colour, tag) = if is_anomalous {
         let kind = tx.injected_anomaly.as_ref().unwrap();
         (colour_for_anomaly(kind), format!("ANOMALY:{kind}"))
@@ -236,7 +200,6 @@ fn print_transaction(
         }
     }
 
-    // In verbose mode also show the raw JSON for easy copy-paste to Student B.
     if verbose {
         if let Ok(pretty) = serde_json::to_string_pretty(tx) {
             println!("{DIM}{pretty}{RESET}");
@@ -244,13 +207,11 @@ fn print_transaction(
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // ── Connect ───────────────────────────────────────────────────────────────
     println!("{BOLD}tx-inspector{RESET} connecting to {}  group={}  offset={}",
         args.broker, args.group, args.offset);
 
@@ -278,14 +239,12 @@ async fn main() -> Result<()> {
 
     let mut stats = Stats::new();
 
-    // ── Read loop ─────────────────────────────────────────────────────────────
     loop {
         let msg = consumer.recv().await
             .context("Kafka recv error")?;
 
         stats.received += 1;
 
-        // ── Step 1: UTF-8 decode ──────────────────────────────────────────────
         let payload = match msg.payload_view::<str>() {
             Some(Ok(s))  => s,
             Some(Err(_)) => {
@@ -304,7 +263,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        // ── Step 2: JSON parse / schema check ─────────────────────────────────
         let tx: Transaction = match serde_json::from_str(payload) {
             Ok(t)  => t,
             Err(e) => {
@@ -316,7 +274,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        // ── Step 3: filter by card_id ─────────────────────────────────────────
         if let Some(ref filter) = args.filter_card {
             if !tx.card_id.contains(filter.as_str()) {
                 consumer.commit_message(&msg, CommitMode::Async)?;
@@ -324,16 +281,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Step 4: sanity checks ─────────────────────────────────────────────
         let issues = sanity_check(&tx);
 
-        // ── Step 5: record stats ──────────────────────────────────────────────
         stats.record_valid(&tx, !issues.is_empty());
 
-        // ── Step 6: print ─────────────────────────────────────────────────────
         print_transaction(&tx, msg.offset(), &issues, args.verbose);
 
-        // ── Step 7: stats summary every 5 s ──────────────────────────────────
         if stats.should_print() {
             stats.print_summary();
         }

@@ -1,11 +1,3 @@
-/// build-fleet — M2-1: generate 10 000 cards and print a summary.
-///
-/// Run:
-///   cargo run --bin build-fleet
-///   cargo run --bin build-fleet -- --cards 500
-///   cargo run --bin build-fleet -- --show 20
-///   cargo run --bin build-fleet -- --seed 42
-
 mod fleet;
 
 use clap::Parser;
@@ -90,8 +82,6 @@ fn assert_fleet(fleet: &[CardState], expected_n: usize) {
         assert!(seen_ids.insert(c.card_id.as_str()), "duplicate card_id");
     }
 }
-
-// ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args = Args::parse();

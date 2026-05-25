@@ -1,29 +1,8 @@
-/// anomaly.rs — all 6 anomaly types for the tx-simulator (M2-4 complete).
-///
-/// IMPORTANT: `injected_anomaly` is ground-truth metadata only.
-/// Flink MUST NOT read it when detecting anomalies.
-/// It exists solely for M5 evaluation: compare "injected" vs "detected".
-///
-/// Return type of maybe_inject() is Vec<Transaction>:
-///   - Normally length 1 (one transaction per tick).
-///   - For HighFrequency: length 5–15 (the burst itself IS the anomaly).
-///   The caller sends every transaction in the vec before moving on.
-
 use crate::fleet::{round2, CardState, Region};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use shared::{AnomalyKind, GpsCoords, Transaction};
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
-/// Generate the next transaction(s) — normal or anomalous.
-///
-/// Returns a Vec<Transaction>:
-///   - length 1 for all anomaly types except HighFrequency
-///   - length 5–15 for HighFrequency (the whole burst)
-///   - length 1 for normal transactions
-///
-/// The second return value is true when any anomaly was injected.
 pub fn maybe_inject(
     card:         &mut CardState,
     normal_tx_fn: impl FnOnce(&mut CardState, &mut SmallRng) -> Transaction,
@@ -39,12 +18,6 @@ pub fn maybe_inject(
     }
 }
 
-// ── Anomaly selector ──────────────────────────────────────────────────────────
-
-/// Pick one of 6 anomaly kinds with equal probability (1/6 each ≈ 16.7%).
-///
-/// At --anomaly-rate 0.01 this gives each type about 0.167% of all
-/// transactions, or roughly 167 anomalies per 100 000 transactions.
 fn pick_kind(rng: &mut SmallRng) -> AnomalyKind {
     match rng.gen_range(0..6) {
         0 => AnomalyKind::LargeAmount,
@@ -56,7 +29,6 @@ fn pick_kind(rng: &mut SmallRng) -> AnomalyKind {
     }
 }
 
-// ── Dispatcher ────────────────────────────────────────────────────────────────
 
 fn inject(card: &mut CardState, kind: AnomalyKind, rng: &mut SmallRng) -> Vec<Transaction> {
     match kind {
@@ -69,12 +41,6 @@ fn inject(card: &mut CardState, kind: AnomalyKind, rng: &mut SmallRng) -> Vec<Tr
     }
 }
 
-// ── LargeAmount ───────────────────────────────────────────────────────────────
-
-/// Amount is 5–15× the card's typical_amount; location stays normal.
-///
-/// Even at 5× the anomaly sits at z ≈ 8σ above the normal distribution
-/// (±50% jitter → σ ≈ 0.29 × typical), well above any z-score threshold.
 fn make_large_amount_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
     // Ensure the limit won't clamp away the anomaly.
     if card.limit < card.typical_amount * 3.0 {
@@ -93,13 +59,7 @@ fn make_large_amount_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction
     build_tx(card, amount, new_limit, location, merchant, AnomalyKind::LargeAmount)
 }
 
-// ── ImpossibleTravel ──────────────────────────────────────────────────────────
 
-/// Location is on a different continent; amount and merchant are normal.
-///
-/// Preferred pairings (maximise Haversine distance, all > 5 000 km):
-///   Poland / WesternEurope → EastAsia   (~8 000–9 000 km)
-///   NorthAmerica / EastAsia → opposite  (~9 000 km)
 fn make_impossible_travel_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
     let foreign_region   = preferred_foreign(card.home_region, rng);
     let foreign_location = foreign_region.sample_location(rng);
@@ -111,9 +71,6 @@ fn make_impossible_travel_tx(card: &mut CardState, rng: &mut SmallRng) -> Transa
 
     card.limit           = new_limit;
     card.last_location   = foreign_location.clone();
-    // Do NOT add foreign_region to visited_regions — ImpossibleTravel is
-    // not a legitimate visit; NewGeography should still fire if this region
-    // appears again later.
 
     build_tx(card, amount, new_limit, foreign_location, merchant, AnomalyKind::ImpossibleTravel)
 }
@@ -126,24 +83,10 @@ fn preferred_foreign(home: Region, rng: &mut SmallRng) -> Region {
         Region::EastAsia      => Region::NorthAmerica,
     };
     if preferred != home { return preferred; }
-    // Defensive fallback (unreachable with current 4 regions).
+
     *Region::ALL.iter().filter(|&&r| r != home).choose(rng).unwrap()
 }
 
-// ── HighFrequency ─────────────────────────────────────────────────────────────
-
-/// Send 5–15 transactions for the same card in rapid succession.
-///
-/// Every transaction in the burst has injected_anomaly = HighFrequency so
-/// Flink's windowed counter can identify the whole burst as anomalous.
-/// Amounts and locations are normal — the anomaly is in the *rate*, not the
-/// individual transaction values.
-///
-/// Why Vec<Transaction>?
-///   HighFrequency can't be represented as a single message — the anomaly
-///   IS the burst. Returning a vec lets the dispatcher send all of them
-///   immediately, before the rate limiter applies, which guarantees they
-///   arrive within seconds of each other in the Kafka partition.
 fn make_high_frequency_burst(card: &mut CardState, rng: &mut SmallRng) -> Vec<Transaction> {
     let burst_size: usize = rng.gen_range(5..=15);
     let mut txs = Vec::with_capacity(burst_size);
@@ -169,36 +112,14 @@ fn make_high_frequency_burst(card: &mut CardState, rng: &mut SmallRng) -> Vec<Tr
     txs
 }
 
-// ── NewGeography ──────────────────────────────────────────────────────────────
 
-/// Transaction in a region this card has never visited before.
-///
-/// How it works:
-///   Each card tracks which regions it has ever appeared in (visited_regions).
-///   At startup, only home_region is in the set.
-///   This function picks a region NOT in visited_regions, samples a GPS
-///   point there, and marks it as visited so the NEXT new-geography anomaly
-///   moves to yet another unvisited region.
-///
-/// Difference from ImpossibleTravel:
-///   - ImpossibleTravel: location is geographically impossible given time
-///     since last transaction (speed > 900 km/h).
-///   - NewGeography: location is simply a region the card has never used —
-///     timing is irrelevant, the surprise is the new region itself.
-///   Both can fire on the same transaction in Flink, but they are triggered
-///   by different signals and use different detection algorithms.
-///
-/// If all four regions have been visited (after 3 anomalies), the card has
-/// nowhere new to go. We fall back to a normal transaction in that case.
 fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
-    // Collect unvisited regions.
     let unvisited: Vec<Region> = Region::ALL
         .iter()
         .copied()
         .filter(|r| !card.visited_regions.contains(r))
         .collect();
 
-    // Fallback: all regions visited — produce a normal transaction.
     if unvisited.is_empty() {
         let raw_amount = card.typical_amount * rng.gen_range(0.5_f64..=1.5);
         let amount     = round2(raw_amount.max(1.0).min(card.limit.max(1.0)));
@@ -207,8 +128,6 @@ fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transactio
         let merchant   = merchant_for(card.home_region, rng);
         card.limit         = new_limit;
         card.last_location = location.clone();
-        // Still mark it as NewGeography so the test suite can tell this
-        // card exhausted all regions — the detector gets a "no-op" event.
         return build_tx(card, amount, new_limit, location, merchant, AnomalyKind::NewGeography);
     }
 
@@ -220,7 +139,6 @@ fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transactio
     let amount       = round2(raw_amount.max(1.0).min(card.limit.max(1.0)));
     let new_limit    = round2((card.limit - amount).max(0.0));
 
-    // Mark this region as visited so future anomalies go somewhere newer.
     card.visited_regions.insert(new_region);
     card.limit         = new_limit;
     card.last_location = location.clone();
@@ -228,27 +146,13 @@ fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transactio
     build_tx(card, amount, new_limit, location, merchant, AnomalyKind::NewGeography)
 }
 
-// ── LimitExhaustion ───────────────────────────────────────────────────────────
 
-/// One transaction drains ≥ 95% of the card's remaining spending limit.
-///
-/// This is suspicious because legitimate large purchases (e.g. a car, a
-/// flight) are typically pre-arranged, but random cards suddenly spending
-/// almost their entire limit in one shot is a fraud signal.
-///
-/// Flink detects this by watching for transactions where
-/// remaining_limit_pln / (amount + remaining_limit_pln) < 0.05.
-///
-/// Implementation note: if the limit is very small (< 50 PLN), we refill
-/// it first so the absolute amount is meaningful — otherwise a 95% drain
-/// of a 3 PLN limit is just 2.85 PLN, which looks normal.
 fn make_limit_exhaustion_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
     // Ensure the limit is large enough that 95% is a meaningful amount.
     if card.limit < 50.0 {
         card.limit = round2(rng.gen_range(1_000.0_f64..=20_000.0));
     }
 
-    // Drain 95–99% of the limit in one transaction.
     let drain_ratio = rng.gen_range(0.95_f64..=0.99);
     let amount      = round2(card.limit * drain_ratio);
     let new_limit   = round2((card.limit - amount).max(0.0));
@@ -261,32 +165,12 @@ fn make_limit_exhaustion_tx(card: &mut CardState, rng: &mut SmallRng) -> Transac
     build_tx(card, amount, new_limit, location, merchant, AnomalyKind::LimitExhaustion)
 }
 
-// ── Structuring ───────────────────────────────────────────────────────────────
-
-/// Amount is just below a round-number reporting threshold.
-///
-/// Real-world structuring (also called "smurfing") splits a large payment
-/// into multiple smaller ones to avoid detection thresholds. Here we model
-/// it as a single transaction that lands just below one of three thresholds
-/// that are common in Polish banking regulations:
-///   500 PLN  — micro-transaction boundary
-///   1 000 PLN — monitoring threshold
-///   5 000 PLN — AML reporting threshold
-///
-/// The amount is in the range [threshold - 50, threshold - 1] PLN, so it
-/// sits just below the threshold but not suspiciously low.
-///
-/// Flink detects this by checking whether the amount is within 50 PLN
-/// below one of the three thresholds.
 fn make_structuring_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
-    // Pick one of the three structuring thresholds.
     let threshold = *[500.0_f64, 1_000.0, 5_000.0].choose(rng).unwrap();
 
-    // Random offset below the threshold in [1, 50] PLN.
     let offset = rng.gen_range(1.0_f64..=50.0);
     let raw_amount = threshold - offset;
 
-    // If the card can't cover the amount, refill to ensure it can.
     if card.limit < raw_amount {
         card.limit = round2(rng.gen_range(
             (raw_amount * 1.5).max(1_000.0)..=20_000.0
@@ -304,9 +188,6 @@ fn make_structuring_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction 
     build_tx(card, amount, new_limit, location, merchant, AnomalyKind::Structuring)
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
-/// Pick a realistic merchant name for the given region.
 pub fn merchant_for(region: Region, rng: &mut SmallRng) -> String {
     let list: &[&str] = match region {
         Region::Poland        => &["Biedronka","Lidl","Żabka","Orlen","BP","InPost","Allegro","PKP Intercity","Empik"],
@@ -317,7 +198,6 @@ pub fn merchant_for(region: Region, rng: &mut SmallRng) -> String {
     list.choose(rng).unwrap().to_string()
 }
 
-/// Assemble a Transaction from pre-computed parts.
 pub fn build_tx(
     card:     &CardState,
     amount:   f64,
@@ -341,7 +221,6 @@ pub fn build_tx(
     }
 }
 
-// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -350,7 +229,6 @@ mod tests {
     use rand::SeedableRng;
     use shared::{AnomalyKind, GpsCoords};
 
-    // ── test helpers ──────────────────────────────────────────────────────────
 
     fn dummy_normal(card: &mut CardState, _rng: &mut SmallRng) -> Transaction {
         use chrono::Utc;
@@ -381,8 +259,6 @@ mod tests {
         build_fleet(n, &mut SmallRng::seed_from_u64(seed))
     }
 
-    // ── LargeAmount ───────────────────────────────────────────────────────────
-
     #[test]
     fn large_amount_is_at_least_5x_typical() {
         let mut rng   = SmallRng::seed_from_u64(42);
@@ -404,8 +280,6 @@ mod tests {
             assert!(tx.remaining_limit_pln >= 0.0);
         }
     }
-
-    // ── ImpossibleTravel ──────────────────────────────────────────────────────
 
     #[test]
     fn impossible_travel_location_outside_home_and_far() {
@@ -437,8 +311,6 @@ mod tests {
                 "distance {distance:.0} km is ≤ 5 000 km");
         }
     }
-
-    // ── HighFrequency ─────────────────────────────────────────────────────────
 
     #[test]
     fn high_frequency_burst_is_5_to_15_transactions() {
@@ -481,8 +353,6 @@ mod tests {
         }
     }
 
-    // ── NewGeography ──────────────────────────────────────────────────────────
-
     #[test]
     fn new_geography_location_is_outside_all_visited_regions() {
         let mut rng   = SmallRng::seed_from_u64(33);
@@ -493,25 +363,17 @@ mod tests {
             let home    = fleet[idx].home_region;
             let visited = fleet[idx].visited_regions.clone();
 
-            // Only check cards with at least one unvisited region.
             if visited.len() == 4 { continue; }
 
             let tx = make_new_geography_tx(&mut fleet[idx], &mut rng);
             assert_eq!(tx.injected_anomaly, Some(AnomalyKind::NewGeography));
 
-            // The location must NOT be inside the home region's bounding box.
-            // Note: Poland and WesternEurope bounding boxes overlap slightly
-            // (Poland lon 14.1–24.1°E, WesternEurope lon -5–15°E share a
-            // 0.9° band). We only assert "not home" rather than "not any
-            // visited" to avoid false failures in that overlap zone.
             assert!(
                 !in_bounding_box(&tx.location, home),
                 "location lat={:.4} lon={:.4} is still inside home region {:?}",
                 tx.location.lat, tx.location.lon, home,
             );
 
-            // The location must be inside SOME known region's bounding box
-            // (not garbage coordinates).
             let in_some = Region::ALL.iter().any(|&r| in_bounding_box(&tx.location, r));
             assert!(in_some,
                 "location lat={:.4} lon={:.4} is not inside any known region",
@@ -524,7 +386,6 @@ mod tests {
         let mut rng   = SmallRng::seed_from_u64(44);
         let mut fleet = fresh_fleet(44, 50);
 
-        // Pick a card that still has unvisited regions.
         let idx = fleet.iter().position(|c| c.visited_regions.len() < 4).unwrap();
         let before_count = fleet[idx].visited_regions.len();
 
@@ -552,9 +413,6 @@ mod tests {
 
             assert_eq!(tx.injected_anomaly, Some(AnomalyKind::LimitExhaustion));
 
-            // Amount must be ≥ 95% of the limit that was in place when the
-            // function ran (after any internal refill).
-            // Use limit_before as lower bound on effective limit.
             let drain_ratio = tx.amount_pln / (tx.amount_pln + tx.remaining_limit_pln);
             assert!(
                 drain_ratio >= 0.94,   // 0.94 not 0.95 for float rounding slack
@@ -568,8 +426,6 @@ mod tests {
         }
     }
 
-    // ── Structuring ───────────────────────────────────────────────────────────
-
     #[test]
     fn structuring_amount_is_just_below_threshold() {
         let mut rng   = SmallRng::seed_from_u64(66);
@@ -582,8 +438,6 @@ mod tests {
 
             assert_eq!(tx.injected_anomaly, Some(AnomalyKind::Structuring));
 
-            // Amount must be within [threshold - 50, threshold - 1] for one
-            // of the three thresholds.
             let near_threshold = thresholds.iter().any(|&t| {
                 tx.amount_pln >= t - 50.0 && tx.amount_pln < t
             });
@@ -597,8 +451,6 @@ mod tests {
             assert!(tx.remaining_limit_pln >= 0.0);
         }
     }
-
-    // ── pick_kind distribution ────────────────────────────────────────────────
 
     #[test]
     fn pick_kind_all_six_types_appear_roughly_equally() {
@@ -626,11 +478,8 @@ mod tests {
                 "kind[{i}] share {pct:.1}% is outside 12–22% (expected ~16.7%)"
             );
         }
-        // All 6 must appear.
         assert!(counts.iter().all(|&c| c > 0), "some kind never appeared");
     }
-
-    // ── maybe_inject end-to-end ───────────────────────────────────────────────
 
     #[test]
     fn maybe_inject_rate_and_field_are_correct() {
@@ -658,8 +507,6 @@ mod tests {
             }
         }
 
-        // At 6% rate expect ~600 ± wide margin (burst transactions count as 1
-        // anomaly event regardless of burst size).
         assert!(anom >= 400 && anom <= 800,
             "Expected ~600 anomaly events at 6% rate, got {anom}");
     }

@@ -1,10 +1,3 @@
-/// tx-inspector — debug consumer for the "transactions" topic.
-///
-/// Validates each message against the shared Transaction schema,
-/// tracks basic statistics, and pretty-prints anomalous transactions.
-/// Run this while developing to verify that the simulator produces
-/// well-formed data before handing off to Student B's Flink pipeline.
-
 use anyhow::Result;
 use clap::Parser;
 use rdkafka::config::ClientConfig;
@@ -20,20 +13,15 @@ struct Args {
     #[arg(long, default_value = "localhost:9092")]
     broker: String,
 
-    /// Consumer group ID (change to re-read from the beginning)
     #[arg(long, default_value = "tx-inspector-dev")]
     group: String,
 
-    /// Print every valid transaction, not just anomalous ones
     #[arg(long)]
     verbose: bool,
 
-    /// Only show messages for a specific card ID
     #[arg(long)]
     filter_card: Option<String>,
 }
-
-// ── Running statistics ────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Stats {
@@ -41,9 +29,7 @@ struct Stats {
     valid:      u64,
     invalid:    u64,
     anomalous:  u64,
-    /// Per-anomaly-kind counts.
     by_kind:    HashMap<String, u64>,
-    /// Amount min/max seen so far.
     amount_min: f64,
     amount_max: f64,
     amount_sum: f64,
@@ -90,8 +76,6 @@ impl Stats {
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -135,7 +119,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        // ── Schema validation ─────────────────────────────────────────────────
         let tx: Transaction = match serde_json::from_str(payload) {
             Ok(t) => t,
             Err(e) => {
@@ -151,7 +134,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        // ── Sanity checks ─────────────────────────────────────────────────────
         let mut issues = Vec::<&str>::new();
         if tx.amount_pln <= 0.0          { issues.push("amount ≤ 0"); }
         if tx.remaining_limit_pln < 0.0  { issues.push("limit < 0"); }
@@ -167,7 +149,6 @@ async fn main() -> Result<()> {
             );
         }
 
-        // ── Filtering ─────────────────────────────────────────────────────────
         if let Some(ref filter) = args.filter_card {
             if &tx.card_id != filter {
                 consumer.commit_message(&msg, CommitMode::Async)?;
@@ -177,7 +158,6 @@ async fn main() -> Result<()> {
 
         stats.record(&tx);
 
-        // ── Output ────────────────────────────────────────────────────────────
         let should_print = args.verbose || tx.injected_anomaly.is_some() || !issues.is_empty();
         if should_print {
             // Pretty-print using serde_json so Flink developers can inspect the schema.
@@ -191,8 +171,7 @@ async fn main() -> Result<()> {
             };
             println!("\n{tag} offset={}\n{pretty}", msg.offset());
         }
-
-        // Print stats every 5 seconds.
+        
         if last_print.elapsed().as_secs() >= 5 {
             stats.print_summary();
             last_print = std::time::Instant::now();

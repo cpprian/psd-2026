@@ -1,10 +1,3 @@
-/// tx-simulator — M2-4 complete: all 6 anomaly types.
-///
-/// Run:
-///   cargo run --bin tx-simulator
-///   cargo run --bin tx-simulator -- --anomaly-rate 0.05
-///   cargo run --bin tx-simulator -- --tps 200 --cards 10000
-
 mod fleet;
 mod anomaly;
 
@@ -20,8 +13,6 @@ use shared::{Transaction, TOPIC_TRANSACTIONS};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(name = "tx-simulator", about = "Send payment transactions (all 6 anomaly types) to Kafka")]
 struct Args {
@@ -31,17 +22,12 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     cards: usize,
 
-    /// Target messages per second (normal cadence; burst anomalies may briefly exceed this).
     #[arg(long, default_value_t = 100)]
     tps: u64,
 
-    /// Probability [0.0–1.0] that any given tick triggers an anomaly.
-    /// Default 0.01 = 1%. Use 0.05 during development to see anomalies faster.
     #[arg(long, default_value_t = 0.01)]
     anomaly_rate: f64,
 }
-
-// ── Merchant names ────────────────────────────────────────────────────────────
 
 const MERCHANTS_POLAND:        &[&str] = &["Biedronka","Lidl","Żabka","Orlen","BP","InPost","Allegro","PKP Intercity","Empik"];
 const MERCHANTS_EUROPE:        &[&str] = &["Carrefour","REWE","Tesco","Shell","Aldi","H&M","Zara","DHL","Lufthansa"];
@@ -56,8 +42,6 @@ fn merchants_for(region: Region) -> &'static [&'static str] {
         Region::EastAsia      => MERCHANTS_EAST_ASIA,
     }
 }
-
-// ── Normal transaction builder ────────────────────────────────────────────────
 
 fn make_normal_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
     let raw_amount = card.typical_amount * rng.gen_range(0.5_f64..=1.5);
@@ -89,8 +73,6 @@ fn make_normal_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
     }
 }
 
-// ── Rate limiter ──────────────────────────────────────────────────────────────
-
 struct RateLimiter { target_tps: u64, tokens: f64, last_refill: Instant }
 
 impl RateLimiter {
@@ -110,8 +92,6 @@ impl RateLimiter {
         }
     }
 }
-
-// ── Progress tracker ──────────────────────────────────────────────────────────
 
 struct Progress {
     sent:      u64,
@@ -147,7 +127,6 @@ impl Progress {
     }
 }
 
-// ── Kafka helpers ─────────────────────────────────────────────────────────────
 
 fn make_producer(broker: &str) -> Result<BaseProducer> {
     ClientConfig::new()
@@ -180,12 +159,9 @@ fn send_tx(
     Ok(())
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Build fleet.
     println!("Building fleet of {} cards...", args.cards);
     let mut rng   = SmallRng::from_entropy();
     let mut fleet = build_fleet(args.cards, &mut rng);
@@ -197,10 +173,8 @@ fn main() -> Result<()> {
     println!("                      NewGeography, LimitExhaustion, Structuring");
     println!("Press Ctrl-C to stop.\n");
 
-    // 2. Connect to Kafka.
     let producer = make_producer(&args.broker)?;
 
-    // 3. Send loop.
     let mut limiter  = RateLimiter::new(args.tps);
     let mut progress = Progress::new();
 
@@ -210,11 +184,6 @@ fn main() -> Result<()> {
         let idx  = rng.gen_range(0..fleet.len());
         let card = &mut fleet[idx];
 
-        // maybe_inject returns Vec<Transaction>:
-        //   - length 1 for all types except HighFrequency
-        //   - length 5–15 for HighFrequency bursts
-        // All transactions in the vec share the same card_id so they land
-        // on the same Kafka partition and are seen in order by Flink.
         let (txs, was_anomalous) = anomaly::maybe_inject(
             card,
             make_normal_tx,
@@ -222,8 +191,6 @@ fn main() -> Result<()> {
             args.anomaly_rate,
         );
 
-        // For burst anomalies: first tx counted as anomalous, rest as normal
-        // so the TPS counter isn't inflated (the burst is one anomaly event).
         for (i, tx) in txs.iter().enumerate() {
             send_tx(&producer, &card.card_id.clone(), tx, &mut progress, was_anomalous && i == 0)?;
         }

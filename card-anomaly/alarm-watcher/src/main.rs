@@ -1,22 +1,3 @@
-/// alarm-watcher — M4: live TUI dashboard for the "alerts" Kafka topic.
-///
-/// Layout:
-///   ┌─────────── header: total count + clock + filter ────────────┐
-///   │  alert table (newest first, scrollable)  │  counts by kind  │
-///   │                                          │  severity chart  │
-///   └─────────────── footer: keybindings ─────────────────────────┘
-///
-/// Keybindings:
-///   q / Ctrl-C   quit
-///   ↑ / ↓        scroll alert table
-///   f            start typing a card-ID filter  (Enter to apply, Esc to cancel)
-///   c            clear active filter
-///
-/// Run:
-///   cargo run --bin alarm-watcher
-///   cargo run --bin alarm-watcher -- --broker localhost:9092
-///   cargo run --bin alarm-watcher -- --offset earliest   (replay stored alerts)
-
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
@@ -42,7 +23,6 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "alarm-watcher", about = "Live TUI dashboard for Flink alerts")]
@@ -53,24 +33,16 @@ struct Args {
     #[arg(long, default_value = "alarm-watcher-dev")]
     group: String,
 
-    /// "latest" = only new alerts after startup.
-    /// "earliest" = replay all stored alerts from the beginning.
     #[arg(long, default_value = "latest")]
     offset: String,
 
-    /// Keep at most this many alerts in memory (oldest are dropped first).
     #[arg(long, default_value_t = 200)]
     buffer: usize,
 }
 
-// ── App state (shared between Kafka thread and render loop) ───────────────────
-
 struct AppState {
-    /// All alerts, oldest first. We render them newest-first by iterating in reverse.
     alerts:        Vec<Alert>,
-    /// Per-kind counts for the bar chart.
     by_kind:       HashMap<String, u64>,
-    /// Severity histogram: five buckets [0,0.2) [0.2,0.4) [0.4,0.6) [0.6,0.8) [0.8,1.0].
     sev_hist:      [u64; 5],
     total_received: u64,
     max_buf:       usize,
@@ -150,8 +122,6 @@ async fn consume_loop(
     }
 }
 
-// ── Colour helpers ────────────────────────────────────────────────────────────
-
 fn severity_color(s: f64) -> Color {
     if s >= 0.8      { Color::Red }
     else if s >= 0.5 { Color::Yellow }
@@ -169,8 +139,6 @@ fn kind_color(kind: &AnomalyKind) -> Color {
     }
 }
 
-// ── TUI render ────────────────────────────────────────────────────────────────
-
 fn draw(
     term:        &mut Terminal<CrosstermBackend<io::Stdout>>,
     state:       &AppState,
@@ -182,7 +150,6 @@ fn draw(
     term.draw(|f| {
         let area = f.size();   // ratatui 0.27 uses f.size()
 
-        // ── Outer layout: header / body / footer ──────────────────────────
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -192,7 +159,6 @@ fn draw(
             ])
             .split(area);
 
-        // ── Header ────────────────────────────────────────────────────────
         let clock   = Local::now().format("%H:%M:%S").to_string();
         let filter_info = match (filter, is_filtering) {
             (_, true)       => format!("  │  filter: {}▌", filter_input),
@@ -211,13 +177,11 @@ fn draw(
             .block(Block::default().borders(Borders::ALL));
         f.render_widget(header, outer[0]);
 
-        // ── Body: alert table (left 65%) + charts (right 35%) ─────────────
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(outer[1]);
 
-        // ── Alert table ───────────────────────────────────────────────────
         let hdr_cells = ["Time", "Card ID", "Anomaly type", "Sev", "Description"]
             .iter()
             .map(|h| {
@@ -226,7 +190,6 @@ fn draw(
             });
         let hdr_row = Row::new(hdr_cells).height(1).bottom_margin(0);
 
-        // Filter and reverse (newest first).
         let shown: Vec<&Alert> = state.alerts.iter().rev()
             .filter(|a| {
                 filter.as_ref().map_or(true, |f| a.card_id.contains(f.as_str()))
@@ -279,22 +242,17 @@ fn draw(
 
         f.render_stateful_widget(alert_table, body[0], table_state);
 
-        // ── Right panel: kind chart + severity histogram ───────────────────
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(body[1]);
 
-        // By-kind bar chart.
-        // ratatui 0.27 BarChart::data() takes impl Into<BarGroup>
-        // which accepts &[(&str, u64)] via From impl.
         let mut kind_vec: Vec<(String, u64)> = state.by_kind
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         kind_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // BarGroup::from needs &[(&str, u64)] — build a vec of refs.
         let kind_refs: Vec<(&str, u64)> = kind_vec
             .iter()
             .map(|(k, v)| (k.as_str(), *v))
@@ -317,7 +275,6 @@ fn draw(
             );
         f.render_widget(kind_chart, right[0]);
 
-        // Severity histogram.
         let sev_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"];
         let sev_refs: Vec<(&str, u64)> = sev_labels
             .iter()
@@ -338,7 +295,6 @@ fn draw(
             .value_style(Style::default().fg(Color::White));
         f.render_widget(sev_chart, right[1]);
 
-        // ── Footer ────────────────────────────────────────────────────────
         let footer_line = if is_filtering {
             Line::from(vec![
                 Span::raw("  Filter: "),
@@ -380,16 +336,12 @@ fn draw(
     Ok(())
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // ── Shared state ──────────────────────────────────────────────────────
     let state = Arc::new(Mutex::new(AppState::new(args.buffer)));
 
-    // ── Kafka consumer on background task ─────────────────────────────────
     {
         let s      = state.clone();
         let broker = args.broker.clone();
@@ -398,21 +350,17 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { consume_loop(broker, group, offset, s).await });
     }
 
-    // ── Set up terminal ───────────────────────────────────────────────────
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend).context("create terminal")?;
 
-    // ── UI state ──────────────────────────────────────────────────────────
     let mut table_state  = TableState::default();
     let mut filter:       Option<String> = None;
     let mut filter_input: String         = String::new();
     let mut is_filtering: bool           = false;
 
-    // ── Event + render loop ───────────────────────────────────────────────
-    // Redraw every 250 ms so new alerts appear promptly even if no key pressed.
     loop {
         {
             let s = state.lock().unwrap();
@@ -422,7 +370,6 @@ async fn main() -> Result<()> {
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if is_filtering {
-                    // ── Filter input mode ─────────────────────────────────
                     match key.code {
                         KeyCode::Enter => {
                             filter = if filter_input.is_empty() {
@@ -432,7 +379,6 @@ async fn main() -> Result<()> {
                             };
                             filter_input.clear();
                             is_filtering = false;
-                            // Reset scroll when filter changes.
                             table_state.select(Some(0));
                         }
                         KeyCode::Esc => {
@@ -444,7 +390,6 @@ async fn main() -> Result<()> {
                         _ => {}
                     }
                 } else {
-                    // ── Normal mode ───────────────────────────────────────
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c')
@@ -476,7 +421,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Restore terminal ──────────────────────────────────────────────────
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
