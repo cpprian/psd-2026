@@ -1,17 +1,23 @@
-/// alarm-watcher — real-time TUI dashboard for the "alerts" Kafka topic.
+/// alarm-watcher — M4: live TUI dashboard for the "alerts" Kafka topic.
 ///
-/// Reads Alert messages produced by Student B's Flink detector and renders
-/// a live terminal UI using ratatui:
-///   - Top panel:  live alert feed (scrollable table)
-///   - Left panel: per-anomaly-kind counts (bar chart)
-///   - Right panel: severity histogram
+/// Layout:
+///   ┌─────────── header: total count + clock + filter ────────────┐
+///   │  alert table (newest first, scrollable)  │  counts by kind  │
+///   │                                          │  severity chart  │
+///   └─────────────── footer: keybindings ─────────────────────────┘
 ///
 /// Keybindings:
-///   q / Ctrl-C  quit
-///   ↑ / ↓       scroll alert table
-///   f           filter by card ID (type, Enter to confirm)
+///   q / Ctrl-C   quit
+///   ↑ / ↓        scroll alert table
+///   f            start typing a card-ID filter  (Enter to apply, Esc to cancel)
+///   c            clear active filter
+///
+/// Run:
+///   cargo run --bin alarm-watcher
+///   cargo run --bin alarm-watcher -- --broker localhost:9092
+///   cargo run --bin alarm-watcher -- --offset earliest   (replay stored alerts)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
 use crossterm::{
@@ -24,26 +30,22 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        BarChart, Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, TableState,
-    },
+    widgets::{BarChart, Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Terminal,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::Message;
-use shared::{Alert, TOPIC_ALERTS};
+use shared::{Alert, AnomalyKind, TOPIC_ALERTS};
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::error;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-#[derive(Parser, Debug)]
-#[command(name = "alarm-watcher", about = "Real-time TUI for Flink alerts")]
+#[derive(Parser)]
+#[command(name = "alarm-watcher", about = "Live TUI dashboard for Flink alerts")]
 struct Args {
     #[arg(long, default_value = "localhost:9092")]
     broker: String,
@@ -51,80 +53,104 @@ struct Args {
     #[arg(long, default_value = "alarm-watcher-dev")]
     group: String,
 
-    /// Maximum number of alerts to keep in memory
-    #[arg(long, default_value_t = 500)]
+    /// "latest" = only new alerts after startup.
+    /// "earliest" = replay all stored alerts from the beginning.
+    #[arg(long, default_value = "latest")]
+    offset: String,
+
+    /// Keep at most this many alerts in memory (oldest are dropped first).
+    #[arg(long, default_value_t = 200)]
     buffer: usize,
 }
 
-// ── Shared state ──────────────────────────────────────────────────────────────
+// ── App state (shared between Kafka thread and render loop) ───────────────────
 
-#[derive(Default)]
 struct AppState {
-    alerts:     Vec<Alert>,
-    by_kind:    HashMap<String, u64>,
-    /// Severity histogram buckets: [0.0,0.2), [0.2,0.4), …, [0.8,1.0]
-    severity_hist: [u64; 5],
-    total: u64,
+    /// All alerts, oldest first. We render them newest-first by iterating in reverse.
+    alerts:        Vec<Alert>,
+    /// Per-kind counts for the bar chart.
+    by_kind:       HashMap<String, u64>,
+    /// Severity histogram: five buckets [0,0.2) [0.2,0.4) [0.4,0.6) [0.6,0.8) [0.8,1.0].
+    sev_hist:      [u64; 5],
+    total_received: u64,
+    max_buf:       usize,
 }
 
 impl AppState {
-    fn push(&mut self, alert: Alert, max_buf: usize) {
-        let kind = format!("{}", alert.anomaly_kind);
-        *self.by_kind.entry(kind).or_insert(0) += 1;
+    fn new(max_buf: usize) -> Self {
+        Self {
+            alerts: Vec::new(),
+            by_kind: HashMap::new(),
+            sev_hist: [0; 5],
+            total_received: 0,
+            max_buf,
+        }
+    }
+
+    fn push(&mut self, alert: Alert) {
+        self.total_received += 1;
+        *self.by_kind.entry(format!("{}", alert.anomaly_kind)).or_insert(0) += 1;
         let bucket = ((alert.severity * 5.0) as usize).min(4);
-        self.severity_hist[bucket] += 1;
-        self.total += 1;
+        self.sev_hist[bucket] += 1;
         self.alerts.push(alert);
-        if self.alerts.len() > max_buf {
+        if self.alerts.len() > self.max_buf {
             self.alerts.remove(0);
         }
     }
 }
 
-// ── Kafka consumer task ────────────────────────────────────────────────────────
+// ── Kafka consumer (runs on a background Tokio task) ─────────────────────────
 
-async fn consume_loop(broker: String, group: String, state: Arc<Mutex<AppState>>, buf: usize) {
+async fn consume_loop(
+    broker: String,
+    group:  String,
+    offset: String,
+    state:  Arc<Mutex<AppState>>,
+) {
     let consumer: StreamConsumer = match ClientConfig::new()
-        .set("bootstrap.servers",   &broker)
-        .set("group.id",            &group)
-        .set("auto.offset.reset",   "latest")
-        .set("enable.auto.commit",  "true")
+        .set("bootstrap.servers",       &broker)
+        .set("group.id",                &group)
+        .set("auto.offset.reset",       &offset)
+        .set("enable.auto.commit",      "true")
+        .set("auto.commit.interval.ms", "1000")
         .create()
     {
-        Ok(c) => c,
-        Err(e) => { error!("Consumer create failed: {e}"); return; }
+        Ok(c)  => c,
+        Err(e) => { eprintln!("Consumer create failed: {e}"); return; }
     };
 
     if let Err(e) = consumer.subscribe(&[TOPIC_ALERTS]) {
-        error!("Subscribe failed: {e}"); return;
+        eprintln!("Subscribe failed: {e}");
+        return;
     }
 
     loop {
         let msg = match consumer.recv().await {
-            Ok(m) => m,
-            Err(e) => { error!("Recv error: {e}"); continue; }
+            Ok(m)  => m,
+            Err(e) => { eprintln!("Recv error: {e}"); continue; }
         };
 
         let payload = match msg.payload_view::<str>() {
             Some(Ok(s)) => s,
-            _ => continue,
+            _           => { let _ = consumer.commit_message(&msg, CommitMode::Async); continue; }
         };
 
         match serde_json::from_str::<Alert>(payload) {
             Ok(alert) => {
                 if let Ok(mut s) = state.lock() {
-                    s.push(alert, buf);
+                    s.push(alert);
                 }
-                let _ = consumer.commit_message(&msg, CommitMode::Async);
             }
             Err(e) => {
-                error!("Alert parse error: {e}\nraw: {payload}");
+                eprintln!("Alert parse error: {e}");
             }
         }
+
+        let _ = consumer.commit_message(&msg, CommitMode::Async);
     }
 }
 
-// ── TUI rendering ─────────────────────────────────────────────────────────────
+// ── Colour helpers ────────────────────────────────────────────────────────────
 
 fn severity_color(s: f64) -> Color {
     if s >= 0.8      { Color::Red }
@@ -132,133 +158,224 @@ fn severity_color(s: f64) -> Color {
     else             { Color::Green }
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &AppState,
-    table_state: &mut TableState,
-    filter: &Option<String>,
-) -> Result<()> {
-    terminal.draw(|f| {
-        let size = f.area();
+fn kind_color(kind: &AnomalyKind) -> Color {
+    match kind {
+        AnomalyKind::LargeAmount      => Color::Red,
+        AnomalyKind::ImpossibleTravel => Color::Red,
+        AnomalyKind::LimitExhaustion  => Color::Red,
+        AnomalyKind::HighFrequency    => Color::Yellow,
+        AnomalyKind::NewGeography     => Color::Yellow,
+        AnomalyKind::Structuring      => Color::Cyan,
+    }
+}
 
-        // ── Main vertical split: header / body / footer ───────────────────
-        let chunks = Layout::default()
+// ── TUI render ────────────────────────────────────────────────────────────────
+
+fn draw(
+    term:        &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state:       &AppState,
+    table_state: &mut TableState,
+    filter:      &Option<String>,
+    filter_input: &str,
+    is_filtering: bool,
+) -> Result<()> {
+    term.draw(|f| {
+        let area = f.size();   // ratatui 0.27 uses f.size()
+
+        // ── Outer layout: header / body / footer ──────────────────────────
+        let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // header
-                Constraint::Min(10),    // body
-                Constraint::Length(3),  // footer
+                Constraint::Length(3),   // header
+                Constraint::Min(6),      // body
+                Constraint::Length(3),   // footer
             ])
-            .split(size);
+            .split(area);
 
         // ── Header ────────────────────────────────────────────────────────
-        let now = Local::now().format("%H:%M:%S").to_string();
+        let clock   = Local::now().format("%H:%M:%S").to_string();
+        let filter_info = match (filter, is_filtering) {
+            (_, true)       => format!("  │  filter: {}▌", filter_input),
+            (Some(f), _)    => format!("  │  filter: {f}"),
+            (None, _)       => String::new(),
+        };
         let header_text = format!(
-            " alarm-watcher  │  total: {}  │  {}{}",
-            state.total,
-            now,
-            filter.as_ref().map(|f| format!("  │  filter: {f}")).unwrap_or_default()
+            " alarm-watcher  │  total received: {}  │  showing: {}  │  {}{}",
+            state.total_received,
+            state.alerts.len(),
+            clock,
+            filter_info,
         );
         let header = Paragraph::new(header_text)
             .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL));
-        f.render_widget(header, chunks[0]);
+        f.render_widget(header, outer[0]);
 
-        // ── Body: table on the left, charts on the right ─────────────────
+        // ── Body: alert table (left 65%) + charts (right 35%) ─────────────
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(chunks[1]);
+            .split(outer[1]);
 
-        // Alert table
-        let header_cells = ["Time", "Card", "Kind", "Severity", "Description"]
+        // ── Alert table ───────────────────────────────────────────────────
+        let hdr_cells = ["Time", "Card ID", "Anomaly type", "Sev", "Description"]
             .iter()
-            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
-        let header_row = Row::new(header_cells).height(1).bottom_margin(0);
+            .map(|h| {
+                Cell::from(*h)
+                    .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Gray))
+            });
+        let hdr_row = Row::new(hdr_cells).height(1).bottom_margin(0);
 
-        let filtered: Vec<&Alert> = state.alerts.iter().rev()
-            .filter(|a| filter.as_ref().map_or(true, |f| a.card_id.contains(f.as_str())))
+        // Filter and reverse (newest first).
+        let shown: Vec<&Alert> = state.alerts.iter().rev()
+            .filter(|a| {
+                filter.as_ref().map_or(true, |f| a.card_id.contains(f.as_str()))
+            })
             .collect();
 
-        let rows = filtered.iter().map(|a| {
-            let ts = a.timestamp.with_timezone(&Local).format("%H:%M:%S").to_string();
-            let sev = format!("{:.2}", a.severity);
-            let color = severity_color(a.severity);
-            Row::new(vec![
-                Cell::from(ts),
-                Cell::from(a.card_id[..a.card_id.len().min(12)].to_string()),
-                Cell::from(format!("{}", a.anomaly_kind)),
-                Cell::from(sev).style(Style::default().fg(color)),
-                Cell::from(a.description[..a.description.len().min(40)].to_string()),
-            ])
-        });
+        let rows: Vec<Row> = shown.iter().map(|a| {
+            let ts      = a.timestamp.with_timezone(&Local).format("%H:%M:%S").to_string();
+            let card    = a.card_id[..a.card_id.len().min(12)].to_string();
+            let kind    = format!("{}", a.anomaly_kind);
+            let sev_str = format!("{:.2}", a.severity);
+            let desc    = a.description[..a.description.len().min(50)].to_string();
 
-        let table = Table::new(
+            let sev_color  = severity_color(a.severity);
+            let kind_color = kind_color(&a.anomaly_kind);
+
+            Row::new(vec![
+                Cell::from(ts)      .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(card)    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Cell::from(kind)    .style(Style::default().fg(kind_color)),
+                Cell::from(sev_str) .style(Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
+                Cell::from(desc)    .style(Style::default().fg(Color::Gray)),
+            ])
+            .height(1)
+        }).collect();
+
+        let alert_table = Table::new(
             rows,
             [
-                Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Length(18),
-                Constraint::Length(9),
-                Constraint::Min(20),
+                Constraint::Length(10),  // time
+                Constraint::Length(13),  // card
+                Constraint::Length(18),  // kind
+                Constraint::Length(5),   // sev
+                Constraint::Min(10),     // description
             ],
         )
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(" Alerts (newest first) "))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .header(hdr_row)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Alerts — newest first ({} shown) ", shown.len()))
+                .title_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .fg(Color::White),
+        )
+        .highlight_symbol("▶ ");
 
-        f.render_stateful_widget(table, body[0], table_state);
+        f.render_stateful_widget(alert_table, body[0], table_state);
 
-        // Right panel: kind bar chart + severity histogram
+        // ── Right panel: kind chart + severity histogram ───────────────────
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(body[1]);
 
-        // By-kind bar chart
-        let mut kind_data: Vec<(&str, u64)> = state.by_kind
+        // By-kind bar chart.
+        // ratatui 0.27 BarChart::data() takes impl Into<BarGroup>
+        // which accepts &[(&str, u64)] via From impl.
+        let mut kind_vec: Vec<(String, u64)> = state.by_kind
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        kind_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // BarGroup::from needs &[(&str, u64)] — build a vec of refs.
+        let kind_refs: Vec<(&str, u64)> = kind_vec
             .iter()
             .map(|(k, v)| (k.as_str(), *v))
             .collect();
-        kind_data.sort_by(|a, b| b.1.cmp(&a.1));
-        let kind_refs: Vec<(&str, u64)> = kind_data.iter().map(|(k, v)| (*k, *v)).collect();
 
         let kind_chart = BarChart::default()
-            .block(Block::default().borders(Borders::ALL).title(" By kind "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" By anomaly type "),
+            )
             .data(&kind_refs)
             .bar_width(3)
             .bar_gap(1)
             .bar_style(Style::default().fg(Color::Cyan))
-            .value_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+            .value_style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
         f.render_widget(kind_chart, right[0]);
 
-        // Severity histogram
-        let sev_labels = ["0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"];
-        let sev_data: Vec<(&str, u64)> = sev_labels.iter().zip(state.severity_hist.iter())
+        // Severity histogram.
+        let sev_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"];
+        let sev_refs: Vec<(&str, u64)> = sev_labels
+            .iter()
+            .zip(state.sev_hist.iter())
             .map(|(l, v)| (*l, *v))
             .collect();
 
         let sev_chart = BarChart::default()
-            .block(Block::default().borders(Borders::ALL).title(" Severity distribution "))
-            .data(&sev_data)
-            .bar_width(5)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Severity distribution "),
+            )
+            .data(&sev_refs)
+            .bar_width(4)
             .bar_gap(1)
             .bar_style(Style::default().fg(Color::Yellow))
             .value_style(Style::default().fg(Color::White));
         f.render_widget(sev_chart, right[1]);
 
         // ── Footer ────────────────────────────────────────────────────────
-        let footer = Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" quit  "),
-            Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" scroll  "),
-            Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" filter by card"),
-        ]))
-        .block(Block::default().borders(Borders::ALL));
-        f.render_widget(footer, chunks[2]);
+        let footer_line = if is_filtering {
+            Line::from(vec![
+                Span::raw("  Filter: "),
+                Span::styled(
+                    format!("{filter_input}▌"),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" apply   "),
+                Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" cancel"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" quit   "),
+                Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" scroll   "),
+                Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" filter by card   "),
+                Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" clear filter"),
+                match filter {
+                    Some(f) => Span::styled(
+                        format!("   active: {f}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    None => Span::raw(""),
+                },
+            ])
+        };
+
+        let footer = Paragraph::new(footer_line)
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(footer, outer[2]);
     })?;
     Ok(())
 }
@@ -269,83 +386,97 @@ fn draw(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let state = Arc::new(Mutex::new(AppState::default()));
+    // ── Shared state ──────────────────────────────────────────────────────
+    let state = Arc::new(Mutex::new(AppState::new(args.buffer)));
 
-    // Spawn Kafka consumer on a background task.
+    // ── Kafka consumer on background task ─────────────────────────────────
     {
-        let state  = state.clone();
+        let s      = state.clone();
         let broker = args.broker.clone();
         let group  = args.group.clone();
-        let buf    = args.buffer;
-        tokio::spawn(async move { consume_loop(broker, group, state, buf).await });
+        let offset = args.offset.clone();
+        tokio::spawn(async move { consume_loop(broker, group, offset, s).await });
     }
 
-    // Set up terminal.
-    enable_raw_mode()?;
+    // ── Set up terminal ───────────────────────────────────────────────────
+    enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend  = CrosstermBackend::new(stdout);
-    let mut term = Terminal::new(backend)?;
+    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut term = Terminal::new(backend).context("create terminal")?;
 
-    let mut table_state = TableState::default();
-    let mut filter: Option<String> = None;
-    let mut filter_input = String::new();
-    let mut filtering = false;
+    // ── UI state ──────────────────────────────────────────────────────────
+    let mut table_state  = TableState::default();
+    let mut filter:       Option<String> = None;
+    let mut filter_input: String         = String::new();
+    let mut is_filtering: bool           = false;
 
+    // ── Event + render loop ───────────────────────────────────────────────
+    // Redraw every 250 ms so new alerts appear promptly even if no key pressed.
     loop {
         {
             let s = state.lock().unwrap();
-            draw(&mut term, &s, &mut table_state, &filter)?;
+            draw(&mut term, &s, &mut table_state, &filter, &filter_input, is_filtering)?;
         }
 
         if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if filtering {
-                        match key.code {
-                            KeyCode::Enter => {
-                                filter = if filter_input.is_empty() {
-                                    None
-                                } else {
-                                    Some(filter_input.clone())
-                                };
-                                filter_input.clear();
-                                filtering = false;
-                            }
-                            KeyCode::Esc => {
-                                filter_input.clear();
-                                filtering = false;
-                            }
-                            KeyCode::Backspace => { filter_input.pop(); }
-                            KeyCode::Char(c)   => { filter_input.push(c); }
-                            _ => {}
+            if let Event::Key(key) = event::read()? {
+                if is_filtering {
+                    // ── Filter input mode ─────────────────────────────────
+                    match key.code {
+                        KeyCode::Enter => {
+                            filter = if filter_input.is_empty() {
+                                None
+                            } else {
+                                Some(filter_input.clone())
+                            };
+                            filter_input.clear();
+                            is_filtering = false;
+                            // Reset scroll when filter changes.
+                            table_state.select(Some(0));
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
-                            KeyCode::Char('f') => { filtering = true; }
-                            KeyCode::Down => {
-                                let s = state.lock().unwrap();
-                                let i = table_state.selected().map_or(0, |i| {
-                                    (i + 1).min(s.alerts.len().saturating_sub(1))
-                                });
-                                table_state.select(Some(i));
-                            }
-                            KeyCode::Up => {
-                                let i = table_state.selected().map_or(0, |i| i.saturating_sub(1));
-                                table_state.select(Some(i));
-                            }
-                            _ => {}
+                        KeyCode::Esc => {
+                            filter_input.clear();
+                            is_filtering = false;
                         }
+                        KeyCode::Backspace => { filter_input.pop(); }
+                        KeyCode::Char(c)   => { filter_input.push(c); }
+                        _ => {}
+                    }
+                } else {
+                    // ── Normal mode ───────────────────────────────────────
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('c')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('f') => {
+                            is_filtering = true;
+                        }
+                        KeyCode::Char('c') => {
+                            filter = None;
+                            table_state.select(Some(0));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let s = state.lock().unwrap();
+                            let max = s.alerts.len().saturating_sub(1);
+                            let next = table_state.selected()
+                                .map_or(0, |i| (i + 1).min(max));
+                            drop(s);
+                            table_state.select(Some(next));
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let prev = table_state.selected()
+                                .map_or(0, |i| i.saturating_sub(1));
+                            table_state.select(Some(prev));
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
     }
 
-    // Restore terminal.
+    // ── Restore terminal ──────────────────────────────────────────────────
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
