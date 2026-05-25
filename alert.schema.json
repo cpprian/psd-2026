@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "alert.schema.json",
+  "title": "Alert",
+  "description": "An anomaly alert raised by Flink. Produced by the Flink detector (Student B), consumed by alarm-watcher (Student A) and saved to MongoDB (Student B).",
+  "type": "object",
+  "required": [
+    "alert_id",
+    "transaction_id",
+    "card_id",
+    "user_id",
+    "timestamp",
+    "anomaly_kind",
+    "description",
+    "severity",
+    "transaction"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "alert_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique ID for this alert event.",
+      "example": "c9d4e5f6-33d4-6a5b-ae1c-000000000003"
+    },
+    "transaction_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID of the transaction that triggered this alert. Matches transaction_id in the Transaction schema."
+    },
+    "card_id": {
+      "type": "string",
+      "pattern": "^CARD-[0-9]{6}$",
+      "description": "Card that was flagged.",
+      "example": "CARD-000042"
+    },
+    "user_id": {
+      "type": "string",
+      "pattern": "^USER-[0-9]{6}$",
+      "description": "Owner of the flagged card.",
+      "example": "USER-000030"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp of when the alert was raised by Flink.",
+      "example": "2026-05-19T14:33:46.001Z"
+    },
+    "anomaly_kind": {
+      "type": "string",
+      "description": "Which detection rule fired.",
+      "enum": [
+        "large_amount",
+        "impossible_travel",
+        "high_frequency",
+        "new_geography",
+        "limit_exhaustion",
+        "structuring"
+      ]
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable explanation of why this alert was raised.",
+      "example": "Amount 8500.00 PLN is 6.2 standard deviations above the 30-transaction mean of 142.50 PLN."
+    },
+    "severity": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Normalised severity score. 0.0 = low risk, 1.0 = critical. Calculated by Flink based on how extreme the anomaly is.",
+      "example": 0.91
+    },
+    "transaction": {
+      "$ref": "#/definitions/TransactionSnapshot",
+      "description": "Full snapshot of the transaction that caused the alert. Embedded so the alert is self-contained."
+    }
+  },
+  "definitions": {
+    "TransactionSnapshot": {
+      "description": "Copy of the Transaction object. Must match transaction.schema.json exactly.",
+      "type": "object",
+      "required": [
+        "transaction_id",
+        "card_id",
+        "user_id",
+        "timestamp",
+        "location",
+        "amount_pln",
+        "remaining_limit_pln",
+        "merchant"
+      ],
+      "properties": {
+        "transaction_id": { "type": "string", "format": "uuid" },
+        "card_id":        { "type": "string" },
+        "user_id":        { "type": "string" },
+        "timestamp":      { "type": "string", "format": "date-time" },
+        "location": {
+          "type": "object",
+          "required": ["lat", "lon"],
+          "properties": {
+            "lat": { "type": "number" },
+            "lon": { "type": "number" }
+          }
+        },
+        "amount_pln":           { "type": "number" },
+        "remaining_limit_pln":  { "type": "number" },
+        "merchant":             { "type": "string" },
+        "injected_anomaly":     { "type": "string" }
+      }
+    }
+  },
+  "examples": [
+    {
+      "alert_id": "c9d4e5f6-33d4-6a5b-ae1c-000000000003",
+      "transaction_id": "b7e2d3a1-22c3-5f4a-9d0b-000000000002",
+      "card_id": "CARD-000042",
+      "user_id": "USER-000030",
+      "timestamp": "2026-05-19T14:33:46.001Z",
+      "anomaly_kind": "impossible_travel",
+      "description": "Card used 8923 km from previous location (Warsaw) within 1 minute. Required travel speed: 535380 km/h.",
+      "severity": 0.97,
+      "transaction": {
+        "transaction_id": "b7e2d3a1-22c3-5f4a-9d0b-000000000002",
+        "card_id": "CARD-000042",
+        "user_id": "USER-000030",
+        "timestamp": "2026-05-19T14:33:45.000Z",
+        "location": { "lat": 35.6762, "lon": 139.6503 },
+        "amount_pln": 8500.00,
+        "remaining_limit_pln": 250.00,
+        "merchant": "FamilyMart",
+        "injected_anomaly": "impossible_travel"
+      }
+    }
+  ]
+}

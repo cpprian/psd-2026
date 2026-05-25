@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "transaction.schema.json",
+  "title": "Transaction",
+  "description": "A single payment card transaction. Produced by tx-simulator (Student A), consumed by Flink detector (Student B) and tx-inspector (Student A).",
+  "type": "object",
+  "required": [
+    "transaction_id",
+    "card_id",
+    "user_id",
+    "timestamp",
+    "location",
+    "amount_pln",
+    "remaining_limit_pln",
+    "merchant"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "transaction_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique ID for this transaction event.",
+      "example": "a3f1c2d4-11b2-4e3f-8c9a-000000000001"
+    },
+    "card_id": {
+      "type": "string",
+      "pattern": "^CARD-[0-9]{6}$",
+      "description": "Unique card identifier. 10 000 distinct values in the simulation.",
+      "example": "CARD-000042"
+    },
+    "user_id": {
+      "type": "string",
+      "pattern": "^USER-[0-9]{6}$",
+      "description": "Card owner. One user may own multiple cards.",
+      "example": "USER-000030"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp of the transaction in ISO-8601 format.",
+      "example": "2026-05-19T14:32:01.123Z"
+    },
+    "location": {
+      "type": "object",
+      "description": "GPS coordinates of the merchant.",
+      "required": ["lat", "lon"],
+      "additionalProperties": false,
+      "properties": {
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "description": "Latitude (WGS-84).",
+          "example": 52.237049
+        },
+        "lon": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180,
+          "description": "Longitude (WGS-84).",
+          "example": 21.017532
+        }
+      }
+    },
+    "amount_pln": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Amount charged in PLN, rounded to 2 decimal places.",
+      "example": 149.99
+    },
+    "remaining_limit_pln": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Spending limit remaining on the card after this transaction.",
+      "example": 3850.01
+    },
+    "merchant": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable merchant name.",
+      "example": "Biedronka"
+    },
+    "injected_anomaly": {
+      "type": "string",
+      "description": "Set by the simulator when this transaction is intentionally anomalous. FOR TESTING ONLY — Flink must not use this field for detection logic.",
+      "enum": [
+        "large_amount",
+        "impossible_travel",
+        "high_frequency",
+        "new_geography",
+        "limit_exhaustion",
+        "structuring"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "transaction_id": "a3f1c2d4-11b2-4e3f-8c9a-000000000001",
+      "card_id": "CARD-000042",
+      "user_id": "USER-000030",
+      "timestamp": "2026-05-19T14:32:01.123Z",
+      "location": { "lat": 52.237049, "lon": 21.017532 },
+      "amount_pln": 149.99,
+      "remaining_limit_pln": 3850.01,
+      "merchant": "Biedronka"
+    },
+    {
+      "transaction_id": "b7e2d3a1-22c3-5f4a-9d0b-000000000002",
+      "card_id": "CARD-000042",
+      "user_id": "USER-000030",
+      "timestamp": "2026-05-19T14:33:45.000Z",
+      "location": { "lat": 35.6762, "lon": 139.6503 },
+      "amount_pln": 8500.00,
+      "remaining_limit_pln": 250.00,
+      "merchant": "FamilyMart",
+      "injected_anomaly": "impossible_travel"
+    }
+  ]
+}

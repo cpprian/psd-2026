@@ -1,0 +1,173 @@
+version: "3.9"
+
+# Card Anomaly Detection — shared infrastructure
+# Both students use this identical file.
+#
+# Start:   docker compose up -d
+# Stop:    docker compose down
+# Reset:   docker compose down -v   (deletes all data)
+#
+# Exposed ports (host):
+#   9092  — Kafka (connect from Rust/Python apps on your machine)
+#   8080  — Kafka UI  (browse topics and messages)
+#   8081  — Flink Web UI
+#   8082  — Mongo Express (browse MongoDB)
+#   27017 — MongoDB
+
+networks:
+  anomaly-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
+  flink-checkpoints:
+
+services:
+
+  # ── Zookeeper ───────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    hostname: zookeeper
+    networks: [anomaly-net]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka ───────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    networks: [anomaly-net]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners:
+      #   PLAINTEXT      — used by containers talking to each other (kafka:29092)
+      #   PLAINTEXT_HOST — used by apps on your host machine (localhost:9092)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+
+  # ── Topic bootstrap ─────────────────────────────────────────────────────────
+  # Creates both topics once on first startup. Exits immediately after.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [anomaly-net]
+    restart: "no"
+    command: >
+      bash -c "
+        echo 'Creating topics...' &&
+        kafka-topics --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic transactions \
+          --partitions 6 \
+          --replication-factor 1 \
+          --config retention.ms=86400000 &&
+        kafka-topics --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic alerts \
+          --partitions 3 \
+          --replication-factor 1 \
+          --config retention.ms=86400000 &&
+        echo 'Topics ready:' &&
+        kafka-topics --bootstrap-server kafka:29092 --list
+      "
+
+  # ── Kafka UI ────────────────────────────────────────────────────────────────
+  # Browse topics, messages, consumer groups at http://localhost:8080
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [anomaly-net]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ── Flink JobManager ────────────────────────────────────────────────────────
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    hostname: flink-jobmanager
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [anomaly-net]
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      # Uncomment once Student B's JAR is built:
+      # - ./flink-detector/target/flink-detector-1.0.jar:/opt/flink/usrlib/detector.jar
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        heartbeat.timeout: 60000
+        rest.bind-port: 8081
+
+  # ── Flink TaskManager ───────────────────────────────────────────────────────
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12-java11
+    depends_on: [flink-jobmanager]
+    networks: [anomaly-net]
+    command: taskmanager
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+
+  # ── MongoDB ─────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    hostname: mongodb
+    networks: [anomaly-net]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret
+      MONGO_INITDB_DATABASE: anomaly_detection
+
+  # ── Mongo Express ───────────────────────────────────────────────────────────
+  # Browse MongoDB at http://localhost:8082
+  mongo-express:
+    image: mongo-express:1.0.2
+    depends_on: [mongodb]
+    networks: [anomaly-net]
+    ports:
+      - "8082:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: secret
+      ME_CONFIG_MONGODB_URL: mongodb://admin:secret@mongodb:27017/
+      ME_CONFIG_BASICAUTH: "false"
+    restart: unless-stopped
