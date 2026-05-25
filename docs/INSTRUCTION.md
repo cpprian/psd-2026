@@ -104,7 +104,7 @@ Use `--anomaly-rate 0.05` during development so anomalies appear frequently. Swi
 
 ---
 
-## Step 5 — Run the transaction inspector
+## Step 4 — Run the transaction inspector
 
 Open another **new terminal** and run:
 
@@ -127,7 +127,7 @@ Stats print automatically every 5 seconds. Normal transactions are not printed u
 
 ---
 
-## Step 6 — View messages in Kafka UI
+## Step 5 — View messages in Kafka UI
 
 Open **http://localhost:8080** in your browser.
 
@@ -141,7 +141,7 @@ The `injected_anomaly` field is set by the simulator when a transaction is inten
 
 ---
 
-## Step 7 — Test your Flink detector without the Rust simulator
+## Step 6 — Test your Flink detector without the Rust simulator
 
 If you want to test your Flink job independently without waiting for the Rust simulator, use the Python mock:
 
@@ -159,7 +159,7 @@ This sends the same JSON schema as the Rust simulator so your Flink code will wo
 
 ---
 
-## Step 8 — Run the alert dashboard
+## Step 7 — Run the alert dashboard
 
 Once your Flink detector is running and producing alerts to the `alerts` topic, open the live dashboard:
 
