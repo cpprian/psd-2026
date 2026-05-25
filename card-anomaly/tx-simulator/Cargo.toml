@@ -1,0 +1,30 @@
+[package]
+name    = "tx-simulator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tx-simulator"
+path = "src/main.rs"
+
+[dependencies]
+shared            = { path = "../shared" }
+rdkafka           = { workspace = true }
+tokio             = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+uuid              = { workspace = true }
+chrono            = { workspace = true }
+rand              = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap              = { workspace = true }
+
+[[bin]]
+name = "send-one"
+path = "src/send_one.rs"
+
+[[bin]]
+name = "build-fleet"
+path = "src/build_fleet.rs"
