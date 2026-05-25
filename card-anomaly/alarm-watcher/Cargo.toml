@@ -1,0 +1,21 @@
+[package]
+name    = "alarm-watcher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "alarm-watcher"
+path = "src/main.rs"
+
+[dependencies]
+shared            = { path = "../shared" }
+rdkafka           = { workspace = true }
+tokio             = { workspace = true }
+serde_json        = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap              = { workspace = true }
+chrono            = { workspace = true }
+ratatui           = { workspace = true }
+crossterm         = { workspace = true }
