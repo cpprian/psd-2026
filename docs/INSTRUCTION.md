@@ -148,7 +148,7 @@ If you want to test your Flink job independently without waiting for the Rust si
 ```bash
 # Create a virtual environment (only once)
 python3 -m venv .venv
-source .venv/bin/activate        # on Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install kafka-python
 
 # Send fake transactions
@@ -288,25 +288,3 @@ docker compose down
 # Stop Docker and delete all data (clean reset)
 docker compose down -v
 ```
-
----
-
-## Troubleshooting
-
-**`cargo build` fails with "No such file or directory" for a C header**
-→ Install the system build tools listed in Prerequisites for your OS.
-
-**`Unknown topic or partition` when running tx-inspector or tx-simulator**
-→ The Kafka topics were not created. Follow the "Create the Kafka topics" step above.
-
-**`Connection refused` on port 9092**
-→ Docker is not running, or the Kafka container has not started yet. Run `docker compose ps` and wait for all services to show `Up`.
-
-**The first `cargo build` is very slow**
-→ Normal. It is downloading and compiling all dependencies (~200 crates). Subsequent builds are much faster.
-
-**`alarm-watcher` shows no alerts**
-→ Either Flink is not running, or it is not writing to the `alerts` topic. Use `mock_alert_producer.py` to test the dashboard independently.
-
-**On macOS: `xcrun: error: invalid active developer path`**
-→ Run `xcode-select --install` and try again.
