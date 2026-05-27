@@ -68,7 +68,7 @@ python mock_alert_producer.py --rate 2
 cargo run --bin alarm-watcher
 ```
 
-See [`docs/instruction.md`](docs/instruction.md) for a full step-by-step setup guide.
+See [`docs/instruction.md`](docs/INSTRUCTION.md) for a full step-by-step setup guide.
 
 ## Kafka Topics
 
