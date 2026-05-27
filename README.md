@@ -29,7 +29,6 @@ tx-simulator
 | `tx-simulator` | Rust | Produces transactions at configurable TPS with 6 anomaly types |
 | `tx-inspector` | Rust | Debug consumer — validates JSON, prints anomalies and stats |
 | `alarm-watcher` | Rust | Live terminal dashboard for Flink alerts |
-| Flink detector | Java | Anomaly detection (Student B) |
 | `mock_tx_producer.py` | Python | Fake transactions for testing Flink without the Rust simulator |
 | `mock_alert_producer.py` | Python | Fake alerts for testing alarm-watcher without Flink |
 
