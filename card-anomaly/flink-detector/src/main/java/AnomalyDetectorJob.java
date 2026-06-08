@@ -167,7 +167,7 @@ public class AnomalyDetectorJob {
 
             int count = state.transactionsInLast60Seconds();
 
-            if (count > 5) {
+            if (count > 10) {
                 String description = String.format(
                         "%d transactions detected for this card in the last 60 seconds.",
                         count
