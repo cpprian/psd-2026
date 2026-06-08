@@ -110,7 +110,7 @@ public class AnomalyDetectorJob {
 
             double spentRatio = tx.amount_pln / totalBeforeTransaction;
 
-            if (spentRatio >= 0.95) {
+            if (spentRatio >= 0.95 && tx.amount_pln >= 100.0) {
                 String description = String.format(
                         "Single transaction spent %.1f%% of available card limit. Amount: %.2f PLN, remaining limit: %.2f PLN.",
                         spentRatio * 100.0,
