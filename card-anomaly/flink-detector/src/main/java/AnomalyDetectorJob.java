@@ -171,8 +171,17 @@ public class AnomalyDetectorJob {
                 return;
             }
 
-            double hours = deltaMillis / 3_600_000.0;
             double distanceKm = previous.location.distanceKm(tx.location);
+
+            if (deltaMillis < 60_000L) {
+                return;
+            }
+
+            if (distanceKm < 300.0) {
+                return;
+            }
+
+            double hours = deltaMillis / 3_600_000.0;
             double speedKmh = distanceKm / hours;
 
             if (speedKmh > 900.0) {
