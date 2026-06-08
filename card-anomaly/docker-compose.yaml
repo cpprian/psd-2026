@@ -119,7 +119,7 @@ services:
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
       # Uncomment once Student B's JAR is built:
-      # - ./flink-detector/target/flink-detector-1.0.jar:/opt/flink/usrlib/detector.jar
+      - ./flink-detector/target/flink-detector-1.0.jar:/opt/flink/usrlib/detector.jar
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
