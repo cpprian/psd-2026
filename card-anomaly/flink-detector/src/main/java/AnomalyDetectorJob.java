@@ -92,13 +92,46 @@ public class AnomalyDetectorJob {
                 return;
             }
 
+            detectLargeAmount(tx, state, out);
+            detectHighFrequency(tx, state, txTimeMillis, out);
             detectLimitExhaustion(tx, out);
             detectStructuring(tx, out);
             detectImpossibleTravel(tx, state, txTimeMillis, out);
 
             state.addAmount(tx.amount_pln);
-            state.addTimestamp(txTimeMillis);
             state.lastTransaction = tx;
+        }
+
+        private void detectLargeAmount(
+                Transaction tx,
+                CardState state,
+                Collector<String> out
+        ) throws Exception {
+            if (state.lastAmounts.size() < 10) {
+                return;
+            }
+
+            double mean = state.meanAmount();
+            double std = state.stdAmount();
+
+            if (std <= 0.0) {
+                return;
+            }
+
+            double zScore = (tx.amount_pln - mean) / std;
+
+            if (zScore >= 3.0 && tx.amount_pln >= 100.0) {
+                String description = String.format(
+                        "Amount %.2f PLN is %.1f standard deviations above recent mean %.2f PLN.",
+                        tx.amount_pln,
+                        zScore,
+                        mean
+                );
+
+                double severity = Math.min(1.0, zScore / 10.0);
+
+                emitAlert(tx, AnomalyKind.LARGE_AMOUNT, description, severity, out);
+            }
         }
 
         private void detectLimitExhaustion(Transaction tx, Collector<String> out) throws Exception {
@@ -121,6 +154,28 @@ public class AnomalyDetectorJob {
                 double severity = Math.min(1.0, spentRatio);
 
                 emitAlert(tx, AnomalyKind.LIMIT_EXHAUSTION, description, severity, out);
+            }
+        }
+
+        private void detectHighFrequency(
+                Transaction tx,
+                CardState state,
+                long txTimeMillis,
+                Collector<String> out
+        ) throws Exception {
+            state.addTimestamp(txTimeMillis);
+
+            int count = state.transactionsInLast60Seconds();
+
+            if (count > 5) {
+                String description = String.format(
+                        "%d transactions detected for this card in the last 60 seconds.",
+                        count
+                );
+
+                double severity = Math.min(1.0, (count - 5) / 10.0);
+
+                emitAlert(tx, AnomalyKind.HIGH_FREQUENCY, description, severity, out);
             }
         }
 
