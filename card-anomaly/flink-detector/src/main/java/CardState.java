@@ -1,10 +1,13 @@
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.EnumSet;
+import java.util.Set;
 
 public class CardState {
     public Transaction lastTransaction;
     public final Deque<Double> lastAmounts = new ArrayDeque<>();
     public final Deque<Long> recentTimestampsMillis = new ArrayDeque<>();
+    public final Set<Region> visitedRegions = EnumSet.noneOf(Region.class);
 
     public void addAmount(double amount) {
         lastAmounts.addLast(amount);

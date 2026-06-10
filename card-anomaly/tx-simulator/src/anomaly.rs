@@ -1,4 +1,4 @@
-use crate::fleet::{round2, CardState, Region};
+use crate::fleet::{local_move, round2, CardState, Region};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use shared::{AnomalyKind, GpsCoords, Transaction};
@@ -50,8 +50,8 @@ fn make_large_amount_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction
     let amount    = round2((card.typical_amount * rng.gen_range(5.0_f64..=15.0))
                         .min(card.limit));
     let new_limit = round2((card.limit - amount).max(0.0));
-    let location  = card.home_region.sample_location(rng);
-    let merchant  = merchant_for(card.home_region, rng);
+    let location  = local_move(card, rng);
+    let merchant  = merchant_for(card.current_region, rng);
 
     card.limit         = new_limit;
     card.last_location = location.clone();
@@ -61,7 +61,7 @@ fn make_large_amount_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction
 
 
 fn make_impossible_travel_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
-    let foreign_region   = preferred_foreign(card.home_region, rng);
+    let foreign_region   = preferred_foreign(card.current_region, rng);
     let foreign_location = foreign_region.sample_location(rng);
 
     let raw_amount = card.typical_amount * rng.gen_range(0.5_f64..=1.5);
@@ -70,21 +70,26 @@ fn make_impossible_travel_tx(card: &mut CardState, rng: &mut SmallRng) -> Transa
     let merchant   = merchant_for(foreign_region, rng);
 
     card.limit           = new_limit;
+    card.current_region  = foreign_region;
     card.last_location   = foreign_location.clone();
+    card.visited_regions.insert(foreign_region);
 
     build_tx(card, amount, new_limit, foreign_location, merchant, AnomalyKind::ImpossibleTravel)
 }
 
-fn preferred_foreign(home: Region, rng: &mut SmallRng) -> Region {
-    let preferred = match home {
+/// Picks a region far from `current` so the resulting jump is always a
+/// genuine cross-region "impossible travel", regardless of where the card
+/// is currently transacting from.
+fn preferred_foreign(current: Region, rng: &mut SmallRng) -> Region {
+    let preferred = match current {
         Region::Poland        => Region::EastAsia,
         Region::WesternEurope => Region::EastAsia,
         Region::NorthAmerica  => Region::EastAsia,
         Region::EastAsia      => Region::NorthAmerica,
     };
-    if preferred != home { return preferred; }
+    if preferred != current { return preferred; }
 
-    *Region::ALL.iter().filter(|&&r| r != home).choose(rng).unwrap()
+    *Region::ALL.iter().filter(|&&r| r != current).choose(rng).unwrap()
 }
 
 fn make_high_frequency_burst(card: &mut CardState, rng: &mut SmallRng) -> Vec<Transaction> {
@@ -100,8 +105,8 @@ fn make_high_frequency_burst(card: &mut CardState, rng: &mut SmallRng) -> Vec<Tr
         let raw_amount = card.typical_amount * rng.gen_range(0.5_f64..=1.5);
         let amount     = round2(raw_amount.max(1.0).min(card.limit));
         let new_limit  = round2((card.limit - amount).max(0.0));
-        let location   = card.home_region.sample_location(rng);
-        let merchant   = merchant_for(card.home_region, rng);
+        let location   = local_move(card, rng);
+        let merchant   = merchant_for(card.current_region, rng);
 
         card.limit         = new_limit;
         card.last_location = location.clone();
@@ -124,8 +129,8 @@ fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transactio
         let raw_amount = card.typical_amount * rng.gen_range(0.5_f64..=1.5);
         let amount     = round2(raw_amount.max(1.0).min(card.limit.max(1.0)));
         let new_limit  = round2((card.limit - amount).max(0.0));
-        let location   = card.home_region.sample_location(rng);
-        let merchant   = merchant_for(card.home_region, rng);
+        let location   = local_move(card, rng);
+        let merchant   = merchant_for(card.current_region, rng);
         card.limit         = new_limit;
         card.last_location = location.clone();
         return build_tx(card, amount, new_limit, location, merchant, AnomalyKind::NewGeography);
@@ -140,6 +145,7 @@ fn make_new_geography_tx(card: &mut CardState, rng: &mut SmallRng) -> Transactio
     let new_limit    = round2((card.limit - amount).max(0.0));
 
     card.visited_regions.insert(new_region);
+    card.current_region = new_region;
     card.limit         = new_limit;
     card.last_location = location.clone();
 
@@ -156,8 +162,8 @@ fn make_limit_exhaustion_tx(card: &mut CardState, rng: &mut SmallRng) -> Transac
     let drain_ratio = rng.gen_range(0.95_f64..=0.99);
     let amount      = round2(card.limit * drain_ratio);
     let new_limit   = round2((card.limit - amount).max(0.0));
-    let location    = card.home_region.sample_location(rng);
-    let merchant    = merchant_for(card.home_region, rng);
+    let location    = local_move(card, rng);
+    let merchant    = merchant_for(card.current_region, rng);
 
     card.limit         = new_limit;
     card.last_location = location.clone();
@@ -179,8 +185,8 @@ fn make_structuring_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction 
 
     let amount    = round2(raw_amount.min(card.limit));
     let new_limit = round2((card.limit - amount).max(0.0));
-    let location  = card.home_region.sample_location(rng);
-    let merchant  = merchant_for(card.home_region, rng);
+    let location  = local_move(card, rng);
+    let merchant  = merchant_for(card.current_region, rng);
 
     card.limit         = new_limit;
     card.last_location = location.clone();
@@ -297,6 +303,7 @@ mod tests {
                 typical_amount:  orig[idx].typical_amount,
                 limit:           orig[idx].limit,
                 home_region:     orig[idx].home_region,
+                current_region:  orig[idx].current_region,
                 last_location:   orig[idx].last_location.clone(),
                 visited_regions: orig[idx].visited_regions.clone(),
             };

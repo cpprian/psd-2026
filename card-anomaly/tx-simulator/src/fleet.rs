@@ -28,14 +28,18 @@ impl Region {
         }
     }
 
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        match self {
+            Self::Poland        => (49.0, 54.9,   14.1,  24.1),
+            Self::WesternEurope => (43.0, 53.0,   -5.0,  15.0),
+            Self::NorthAmerica  => (25.0, 50.0, -125.0, -65.0),
+            Self::EastAsia      => (22.0, 45.0,  100.0, 145.0),
+        }
+    }
+
     pub fn sample_location(&self, rng: &mut SmallRng) -> GpsCoords {
-        let (lat, lon) = match self {
-            Self::Poland        => (49.0_f64..54.9,  14.1..24.1),
-            Self::WesternEurope => (43.0..53.0,      -5.0..15.0),
-            Self::NorthAmerica  => (25.0..50.0,    -125.0..-65.0),
-            Self::EastAsia      => (22.0..45.0,     100.0..145.0),
-        };
-        GpsCoords::new(rng.gen_range(lat), rng.gen_range(lon))
+        let (lat_min, lat_max, lon_min, lon_max) = self.bounds();
+        GpsCoords::new(rng.gen_range(lat_min..lat_max), rng.gen_range(lon_min..lon_max))
     }
 
     #[allow(dead_code)]
@@ -56,6 +60,11 @@ pub struct CardState {
     pub typical_amount:  f64,
     pub limit:           f64,
     pub home_region:     Region,
+    /// Region the card is currently transacting from. Differs from
+    /// `home_region` while the card is "abroad" after an ImpossibleTravel
+    /// or NewGeography injection, so that subsequent transactions continue
+    /// from there instead of snapping back home.
+    pub current_region:  Region,
     pub last_location:   GpsCoords,
     pub visited_regions: HashSet<Region>,
 }
@@ -82,11 +91,25 @@ pub fn build_fleet(n: usize, rng: &mut SmallRng) -> Vec<CardState> {
                 typical_amount:  round2(typical),
                 limit:           round2(limit),
                 home_region:     region,
+                current_region:  region,
                 last_location:   location,
                 visited_regions: visited,
             }
         })
         .collect()
+}
+
+/// Next location for everyday card activity: a small, city-scale move around
+/// the previous location, kept inside the card's current region. Hops stay
+/// well under the detector's 300 km impossible-travel floor, so ordinary
+/// activity never looks like teleportation (region bounding boxes span
+/// thousands of km — sampling them uniformly made consecutive transactions
+/// of one card jump across the continent).
+pub fn local_move(card: &CardState, rng: &mut SmallRng) -> GpsCoords {
+    let (lat_min, lat_max, lon_min, lon_max) = card.current_region.bounds();
+    let lat = (card.last_location.lat + rng.gen_range(-0.25_f64..=0.25)).clamp(lat_min, lat_max);
+    let lon = (card.last_location.lon + rng.gen_range(-0.35_f64..=0.35)).clamp(lon_min, lon_max);
+    GpsCoords::new(lat, lon)
 }
 
 /// Round to 2 decimal places.

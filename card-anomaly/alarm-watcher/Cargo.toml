@@ -18,3 +18,5 @@ chrono     = { workspace = true }
 ratatui    = { workspace = true }
 crossterm  = { workspace = true }
 mongodb = "3"
+futures-util = "0.3"
+uuid       = { workspace = true }

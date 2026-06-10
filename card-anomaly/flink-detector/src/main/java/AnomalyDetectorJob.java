@@ -96,7 +96,13 @@ public class AnomalyDetectorJob {
             detectHighFrequency(tx, state, txTimeMillis, out);
             detectLimitExhaustion(tx, out);
             detectStructuring(tx, out);
-            detectImpossibleTravel(tx, state, txTimeMillis, out);
+
+            // A first visit to a new region always also looks like impossible
+            // travel; report it only as NEW_GEOGRAPHY to avoid double-counting.
+            boolean newRegion = detectNewGeography(tx, state, out);
+            if (!newRegion) {
+                detectImpossibleTravel(tx, state, txTimeMillis, out);
+            }
 
             state.addAmount(tx.amount_pln);
             state.lastTransaction = tx;
@@ -107,7 +113,9 @@ public class AnomalyDetectorJob {
                 CardState state,
                 Collector<String> out
         ) throws Exception {
-            if (state.lastAmounts.size() < 10) {
+            // 5 transactions are enough history for a coarse baseline; waiting
+            // for more delays the first possible alert per card considerably.
+            if (state.lastAmounts.size() < 5) {
                 return;
             }
 
@@ -128,7 +136,8 @@ public class AnomalyDetectorJob {
                         mean
                 );
 
-                double severity = Math.min(1.0, zScore / 10.0);
+                // zScore == 3.0 (just over the trigger) -> 0.3, zScore >= 43 -> 1.0.
+                double severity = Math.min(1.0, 0.3 + (zScore - 3.0) / 40.0);
 
                 emitAlert(tx, AnomalyKind.LARGE_AMOUNT, description, severity, out);
             }
@@ -151,7 +160,8 @@ public class AnomalyDetectorJob {
                         tx.remaining_limit_pln
                 );
 
-                double severity = Math.min(1.0, spentRatio);
+                // spentRatio == 0.95 (just over the trigger) -> 0.0, spentRatio == 1.0 -> 1.0.
+                double severity = Math.min(1.0, Math.max(0.0, (spentRatio - 0.95) / 0.05));
 
                 emitAlert(tx, AnomalyKind.LIMIT_EXHAUSTION, description, severity, out);
             }
@@ -173,7 +183,8 @@ public class AnomalyDetectorJob {
                         count
                 );
 
-                double severity = Math.min(1.0, (count - 5) / 10.0);
+                // count == 11 (just over the trigger) -> 0.1, count >= 20 -> 1.0.
+                double severity = Math.min(1.0, (count - 10) / 10.0);
 
                 emitAlert(tx, AnomalyKind.HIGH_FREQUENCY, description, severity, out);
             }
@@ -247,10 +258,48 @@ public class AnomalyDetectorJob {
                         speedKmh
                 );
 
-                double severity = Math.min(1.0, speedKmh / 5000.0);
+                // Speed spans many orders of magnitude above the 900 km/h trigger,
+                // so scale on a log axis: 900 km/h -> 0.0, 200 000 km/h -> 1.0.
+                double severity = Math.min(1.0, Math.max(0.0,
+                        (Math.log10(speedKmh) - Math.log10(900.0)) / (Math.log10(200_000.0) - Math.log10(900.0))
+                ));
 
                 emitAlert(tx, AnomalyKind.IMPOSSIBLE_TRAVEL, description, severity, out);
             }
+        }
+
+        /** Returns true when the transaction was reported as a new-geography alert. */
+        private boolean detectNewGeography(Transaction tx, CardState state, Collector<String> out) throws Exception {
+            Region region = Region.classify(tx.location);
+
+            if (region == Region.UNKNOWN) {
+                return false;
+            }
+
+            if (state.visitedRegions.isEmpty()) {
+                // First transaction seen for this card - establish the baseline,
+                // don't alert on it.
+                state.visitedRegions.add(region);
+                return false;
+            }
+
+            if (state.visitedRegions.contains(region)) {
+                return false;
+            }
+
+            int visitedBefore = state.visitedRegions.size();
+            state.visitedRegions.add(region);
+
+            String description = String.format(
+                    "Card used for the first time in a new region (%s). Previously seen in %d region(s).",
+                    region, visitedBefore
+            );
+
+            // 1 region seen before -> 0.5, 3 regions seen before -> 0.9.
+            double severity = Math.min(1.0, 0.3 + 0.2 * visitedBefore);
+
+            emitAlert(tx, AnomalyKind.NEW_GEOGRAPHY, description, severity, out);
+            return true;
         }
 
         private void emitAlert(
