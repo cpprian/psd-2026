@@ -17,6 +17,7 @@ use ratatui::{
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::Message;
+use mongodb::{bson::Document, Client, Collection};
 use shared::{Alert, AnomalyKind, TOPIC_ALERTS};
 use std::collections::HashMap;
 use std::io;
@@ -38,6 +39,15 @@ struct Args {
 
     #[arg(long, default_value_t = 200)]
     buffer: usize,
+
+    #[arg(long, default_value = "mongodb://admin:secret@localhost:27017/?authSource=admin")]
+    mongo_uri: String,
+
+    #[arg(long, default_value = "anomaly_detection")]
+    mongo_db: String,
+
+    #[arg(long, default_value = "alerts")]
+    mongo_collection: String,
 }
 
 struct AppState {
@@ -78,6 +88,7 @@ async fn consume_loop(
     group:  String,
     offset: String,
     state:  Arc<Mutex<AppState>>,
+    alerts_collection: Collection<Document>,
 ) {
     let consumer: StreamConsumer = match ClientConfig::new()
         .set("bootstrap.servers",       &broker)
@@ -103,12 +114,32 @@ async fn consume_loop(
         };
 
         let payload = match msg.payload_view::<str>() {
-            Some(Ok(s)) => s,
+            Some(Ok(s)) => s.to_string(),
             _           => { let _ = consumer.commit_message(&msg, CommitMode::Async); continue; }
         };
-
-        match serde_json::from_str::<Alert>(payload) {
+        
+        match serde_json::from_str::<Alert>(&payload) {
             Ok(alert) => {
+                match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(value) => {
+                        match mongodb::bson::to_document(&value) {
+                            Ok(mut document) => {
+                                document.insert("stored_at", mongodb::bson::DateTime::now());
+
+                                if let Err(e) = alerts_collection.insert_one(document).await {
+                                    eprintln!("MongoDB insert error: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("BSON conversion error: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("JSON parse for MongoDB error: {e}");
+                    }
+                }
+
                 if let Ok(mut s) = state.lock() {
                     s.push(alert);
                 }
@@ -342,12 +373,21 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(Mutex::new(AppState::new(args.buffer)));
 
+    let mongo_client = Client::with_uri_str(&args.mongo_uri)
+    .await
+    .context("connect to MongoDB")?;
+
+    let alerts_collection = mongo_client
+    .database(&args.mongo_db)
+    .collection::<Document>(&args.mongo_collection);
+
     {
         let s      = state.clone();
         let broker = args.broker.clone();
         let group  = args.group.clone();
         let offset = args.offset.clone();
-        tokio::spawn(async move { consume_loop(broker, group, offset, s).await });
+        let collection = alerts_collection.clone();
+        tokio::spawn(async move { consume_loop(broker, group, offset, s, collection).await });
     }
 
     enable_raw_mode().context("enable raw mode")?;

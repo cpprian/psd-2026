@@ -17,3 +17,4 @@ clap       = { workspace = true }
 chrono     = { workspace = true }
 ratatui    = { workspace = true }
 crossterm  = { workspace = true }
+mongodb = "3"
