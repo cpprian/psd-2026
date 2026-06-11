@@ -1,12 +1,5 @@
 version: "3.9"
 
-# Card Anomaly Detection — shared infrastructure
-# Both students use this identical file.
-#
-# Start:   docker compose up -d
-# Stop:    docker compose down
-# Reset:   docker compose down -v   (deletes all data)
-#
 # Exposed ports (host):
 #   9092  — Kafka (connect from Rust/Python apps on your machine)
 #   8080  — Kafka UI  (browse topics and messages)
@@ -50,9 +43,6 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Two listeners:
-      #   PLAINTEXT      — used by containers talking to each other (kafka:29092)
-      #   PLAINTEXT_HOST — used by apps on your host machine (localhost:9092)
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -67,7 +57,6 @@ services:
       retries: 8
 
   # ── Topic bootstrap ─────────────────────────────────────────────────────────
-  # Creates both topics once on first startup. Exits immediately after.
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     depends_on:
@@ -94,7 +83,6 @@ services:
       "
 
   # ── Kafka UI ────────────────────────────────────────────────────────────────
-  # Browse topics, messages, consumer groups at http://localhost:8080
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     depends_on:
@@ -158,7 +146,6 @@ services:
       MONGO_INITDB_DATABASE: anomaly_detection
 
   # ── Mongo Express ───────────────────────────────────────────────────────────
-  # Browse MongoDB at http://localhost:8082
   mongo-express:
     image: mongo-express:1.0.2
     depends_on: [mongodb]

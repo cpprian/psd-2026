@@ -77,9 +77,7 @@ fn make_impossible_travel_tx(card: &mut CardState, rng: &mut SmallRng) -> Transa
     build_tx(card, amount, new_limit, foreign_location, merchant, AnomalyKind::ImpossibleTravel)
 }
 
-/// Picks a region far from `current` so the resulting jump is always a
-/// genuine cross-region "impossible travel", regardless of where the card
-/// is currently transacting from.
+
 fn preferred_foreign(current: Region, rng: &mut SmallRng) -> Region {
     let preferred = match current {
         Region::Poland        => Region::EastAsia,

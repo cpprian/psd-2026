@@ -53,9 +53,6 @@ fn make_normal_tx(card: &mut CardState, rng: &mut SmallRng) -> Transaction {
         round2((card.limit - amount).max(0.0))
     };
 
-    // Cards move in small city-scale steps; only injected anomalies make
-    // region-sized jumps. A card that "traveled" stays in the new region
-    // (an abrupt jump back home would itself be impossible travel).
     let location = fleet::local_move(card, rng);
     let merchant = merchants_for(card.current_region).choose(rng).unwrap().to_string();
 
